@@ -1,47 +1,47 @@
 """
-Backend OCR con Claude API (vision)
-=====================================
+Backend OCR self-hosted con EasyOCR (GRATUITO, nessuna API a pagamento)
+=========================================================================
 
-Riceve dal frontend un fotogramma (JPEG in base64), lo manda a Claude con
-un prompt che chiede di leggere SOLO i due codici (quello che inizia per
-"D" e quello che inizia per "V") e risponde in JSON pulito.
+Riceve dal frontend un fotogramma (JPEG in base64), lo analizza con EasyOCR
+(libreria open-source basata su deep learning, gira interamente sul server,
+nessun costo per chiamata) e cerca i due codici (uno che inizia per "D",
+uno che inizia per "V").
 
-La API key resta SEMPRE sul server, mai esposta al browser.
+REQUISITI HARDWARE
+-------------------
+EasyOCR usa PyTorch. Su CPU (nessuna GPU) serve almeno 2 vCPU / 4GB RAM
+per tempi di risposta ragionevoli (1-3 secondi per immagine). Su istanze
+troppo piccole (es. t2/t3.micro) puo' essere lento o non avviarsi per
+mancanza di memoria.
 
 INSTALLAZIONE
 --------------
-    pip install fastapi uvicorn anthropic python-multipart
+    pip install fastapi uvicorn easyocr pillow numpy python-multipart
+
+Il primo avvio scarica i pesi del modello (~100MB), poi restano in cache.
 
 AVVIO
 -----
-    export ANTHROPIC_API_KEY="sk-ant-..."
     uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import base64
-import json
+import io
 import logging
-import os
+import re
 
-from anthropic import Anthropic
+import easyocr
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-if not API_KEY:
-    raise RuntimeError("Imposta la variabile d'ambiente ANTHROPIC_API_KEY")
+app = FastAPI(title="OCR Codici Backend (EasyOCR, gratuito)")
 
-client = Anthropic(api_key=API_KEY)
-
-app = FastAPI(title="OCR Codici Backend")
-
-# In produzione, se frontend e backend sono sullo stesso dominio dietro Nginx
-# (come nel setup con /api/ proxato), il CORS non serve. Lo lasciamo aperto
-# per facilitare i test in locale.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,16 +49,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PROMPT = """Guarda l'immagine e trova due codici stampati:
-- un codice che inizia con la lettera "D" (maiuscola o minuscola)
-- un codice che inizia con la lettera "V" (maiuscola o minuscola)
+# Caricato una sola volta all'avvio del processo (lento al primo avvio,
+# poi resta in memoria per tutte le richieste successive).
+logger.info("Caricamento modello EasyOCR in corso...")
+reader = easyocr.Reader(["en"], gpu=False)
+logger.info("Modello EasyOCR pronto.")
 
-Rispondi SOLO con un oggetto JSON, senza testo aggiuntivo, in questo formato esatto:
-{"d": "<codice trovato o null>", "v": "<codice trovato o null>"}
-
-Se un codice non è visibile o leggibile con certezza, usa null per quel campo.
-Non inventare mai un codice: se hai dubbi, metti null.
-"""
+REGEX_D = re.compile(r"\b([dD][A-Za-z0-9]{3,})\b")
+REGEX_V = re.compile(r"\b([vV][A-Za-z0-9]{3,})\b")
 
 
 class OCRRequest(BaseModel):
@@ -70,59 +68,47 @@ class OCRResponse(BaseModel):
     v: str | None = None
 
 
+def pulisci_token(testo: str) -> str:
+    """Rimuove spazi e caratteri non alfanumerici tipici di errori OCR."""
+    return re.sub(r"[^A-Za-z0-9]", "", testo)
+
+
 @app.post("/api/ocr", response_model=OCRResponse)
 async def leggi_codici(payload: OCRRequest) -> OCRResponse:
     try:
         image_bytes = base64.b64decode(payload.image_base64)
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Immagine base64 non valida")
 
+    img_np = np.array(img)
+
     try:
-        risposta = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=200,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": payload.image_base64,
-                            },
-                        },
-                        {"type": "text", "text": PROMPT},
-                    ],
-                }
-            ],
-        )
+        risultati = reader.readtext(img_np, detail=0)  # lista di stringhe lette
     except Exception as e:
-        logger.exception("Errore chiamata Claude API")
-        raise HTTPException(status_code=502, detail=f"Errore API: {e}")
+        logger.exception("Errore EasyOCR")
+        raise HTTPException(status_code=502, detail=f"Errore OCR: {e}")
 
-    testo = "".join(
-        block.text for block in risposta.content if getattr(block, "type", None) == "text"
-    ).strip()
+    testo_completo = " ".join(risultati)
+    testo_pulito_per_match = testo_completo  # i separatori (spazi) aiutano il match \b
 
-    # Pulizia difensiva: a volte i modelli aggiungono ```json ... ``` attorno
-    testo = testo.replace("```json", "").replace("```", "").strip()
+    codice_d = None
+    codice_v = None
 
-    try:
-        dati = json.loads(testo)
-    except json.JSONDecodeError:
-        logger.warning("Risposta non JSON valida: %s", testo)
-        return OCRResponse(d=None, v=None)
+    match_d = REGEX_D.search(testo_pulito_per_match)
+    if match_d:
+        codice_d = pulisci_token(match_d.group(1))
 
-    d = dati.get("d")
-    v = dati.get("v")
-    d = None if d in ("null", "", None) else d
-    v = None if v in ("null", "", None) else v
+    match_v = REGEX_V.search(testo_pulito_per_match)
+    if match_v:
+        codice_v = pulisci_token(match_v.group(1))
 
-    return OCRResponse(d=d, v=v)
+    logger.info("OCR letto: %r -> D=%s V=%s", testo_completo, codice_d, codice_v)
+
+    return OCRResponse(d=codice_d, v=codice_v)
 
 
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+

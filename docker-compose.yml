@@ -11,8 +11,6 @@ services:
 
   backend:
     build: ./backend
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     restart: unless-stopped
     # Nota: non esponiamo la porta del backend all'esterno: la raggiunge
     # solo "frontend" via rete Docker interna (proxy_pass http://backend:8000/).
