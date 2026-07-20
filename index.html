@@ -3,9 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Scansione codici</title>
+<title>Scansione codici (Claude OCR)</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -18,8 +17,26 @@
     align-items: center;
     padding: 12px;
   }
-  h2 { margin: 8px 0; font-size: 18px; }
-  #reader { width: 100%; max-width: 420px; border-radius: 12px; overflow: hidden; }
+  h2 { margin: 8px 0; font-size: 18px; text-align: center; }
+  .camera-wrap {
+    position: relative;
+    width: 100%;
+    max-width: 420px;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #000;
+  }
+  video { width: 100%; display: block; }
+  .cornice {
+    position: absolute;
+    inset: 0;
+    border: 3px solid #4cd964;
+    border-radius: 12px;
+    pointer-events: none;
+    transition: border-color 0.2s;
+    box-sizing: border-box;
+  }
+  .cornice.scansione { border-color: #ff9f0a; }
   .status {
     width: 100%; max-width: 420px;
     margin-top: 12px;
@@ -32,20 +49,35 @@
   .ok { color: #4cd964; }
   .pending { color: #ff9f0a; }
   progress { width: 100%; max-width: 420px; margin-top: 10px; height: 10px; }
+  #scanState { font-size: 12px; color: #8e8e93; margin-top: 6px; }
   #log {
     width: 100%; max-width: 420px;
     margin-top: 10px;
-    max-height: 160px;
+    max-height: 140px;
     overflow-y: auto;
     font-size: 12px;
     color: #8e8e93;
   }
   #log div { padding: 2px 0; border-bottom: 1px solid #2c2c2e; }
+  button {
+    margin-top: 10px;
+    padding: 10px 18px;
+    border-radius: 10px;
+    border: none;
+    background: #2c2c2e;
+    color: #fff;
+    font-size: 14px;
+  }
 </style>
 </head>
 <body>
-  <h2>Scansione in tempo reale (0/55)</h2>
-  <div id="reader"></div>
+  <h2 id="titolo">Lettura codici (0/55)</h2>
+
+  <div class="camera-wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <div class="cornice" id="guida"></div>
+  </div>
+  <canvas id="canvas" style="display:none;"></canvas>
 
   <div class="status">
     <div class="row"><span>Codice D:</span><span id="valD" class="pending">in attesa…</span></div>
@@ -54,29 +86,56 @@
   </div>
 
   <progress id="barra" max="55" value="0"></progress>
+  <div id="scanState">Avvio fotocamera…</div>
+  <button id="btnConferma" style="display:none;">✅ Conferma riga manualmente</button>
   <div id="log"></div>
 
 <script>
 const TOTALE_RIGHE = 55;
-const PREFISSO_D = "d";
-const PREFISSO_V = "V";
+const INTERVALLO_SCAN_MS = 2500; // ogni quanto interrogare il backend
+const ENDPOINT_OCR = "/api/ocr"; // proxato da Nginx verso il backend FastAPI
 
 const tg = window.Telegram.WebApp;
 tg.expand();
 tg.ready();
 
-let righe = [];          // array di {d, v, concat}
+let righe = [];
 let codiceD = null;
 let codiceV = null;
-let ultimoTesto = "";
-let ultimoTempo = 0;
+let scanning = false;
+let richiestaInCorso = false;
+let audioCtx = null;
 
+function suonaBip(frequenza = 880, durataMs = 120) {
+  try {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    const oscillatore = audioCtx.createOscillator();
+    const guadagno = audioCtx.createGain();
+    oscillatore.type = "sine";
+    oscillatore.frequency.value = frequenza;
+    guadagno.gain.value = 0.15;
+    oscillatore.connect(guadagno);
+    guadagno.connect(audioCtx.destination);
+    oscillatore.start();
+    oscillatore.stop(audioCtx.currentTime + durataMs / 1000);
+  } catch (e) {
+    // Se l'audio non è disponibile (es. autoplay bloccato), ignora silenziosamente
+  }
+}
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const guida = document.getElementById("guida");
 const elD = document.getElementById("valD");
 const elV = document.getElementById("valV");
 const elConteggio = document.getElementById("conteggio");
 const elBarra = document.getElementById("barra");
-const elTitolo = document.querySelector("h2");
+const elTitolo = document.getElementById("titolo");
 const elLog = document.getElementById("log");
+const elScanState = document.getElementById("scanState");
+const btnConferma = document.getElementById("btnConferma");
 
 function log(msg) {
   const d = document.createElement("div");
@@ -91,71 +150,131 @@ function aggiornaUI() {
   elV.className = codiceV ? "ok" : "pending";
   elConteggio.textContent = `${righe.length} / ${TOTALE_RIGHE}`;
   elBarra.value = righe.length;
-  elTitolo.textContent = `Scansione in tempo reale (${righe.length}/${TOTALE_RIGHE})`;
+  elTitolo.textContent = `Lettura codici (${righe.length}/${TOTALE_RIGHE})`;
+  btnConferma.style.display = (codiceD && codiceV) ? "block" : "none";
 }
 
-function provaChiudiRiga() {
-  if (codiceD && codiceV) {
-    const concat = `${codiceD}/${codiceV}`;
-    righe.push({ d: codiceD, v: codiceV, concat });
-    log(`Riga ${righe.length}: ${codiceD} | ${codiceV} | ${concat}`);
-    codiceD = null;
-    codiceV = null;
-    aggiornaUI();
+function chiudiRiga() {
+  if (!(codiceD && codiceV)) return;
+  const concat = `${codiceD}/${codiceV}`;
+  righe.push({ d: codiceD, v: codiceV, concat });
+  log(`Riga ${righe.length}: ${codiceD} | ${codiceV} | ${concat}`);
+  codiceD = null;
+  codiceV = null;
+  aggiornaUI();
 
-    if (righe.length >= TOTALE_RIGHE) {
-      concludi();
-    } else {
-      tg.HapticFeedback.notificationOccurred("success");
-    }
+  if (righe.length >= TOTALE_RIGHE) {
+    concludi();
+  } else {
+    tg.HapticFeedback.notificationOccurred("success");
+    suonaBip(1200, 100);
+    setTimeout(() => suonaBip(1400, 140), 130);
   }
 }
 
 function concludi() {
-  html5QrCode.stop().catch(() => {});
+  scanning = false;
   elTitolo.textContent = "Completato! Invio dati al bot…";
   tg.sendData(JSON.stringify({ righe }));
-  // sendData chiude automaticamente la Web App dopo l'invio
 }
 
-function onScanSuccess(decodedText) {
-  // Evita di processare lo stesso identico testo più volte di seguito
-  const ora = Date.now();
-  if (decodedText === ultimoTesto && ora - ultimoTempo < 1500) return;
-  ultimoTesto = decodedText;
-  ultimoTempo = ora;
+async function avviaFotocamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+  });
+  video.srcObject = stream;
+  await new Promise((res) => (video.onloadedmetadata = res));
+}
 
-  if (decodedText.toLowerCase().startsWith(PREFISSO_D.toLowerCase())) {
-    if (codiceD !== decodedText) {
-      codiceD = decodedText;
-      tg.HapticFeedback.impactOccurred("light");
-      aggiornaUI();
-      provaChiudiRiga();
-    }
-  } else if (decodedText.toLowerCase().startsWith(PREFISSO_V.toLowerCase())) {
-    if (codiceV !== decodedText) {
-      codiceV = decodedText;
-      tg.HapticFeedback.impactOccurred("light");
-      aggiornaUI();
-      provaChiudiRiga();
+function catturaFotogrammaJPEG() {
+  const ctx = canvas.getContext("2d");
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
+
+  // Usa l'intero fotogramma della fotocamera, nessun ritaglio
+  canvas.width = vw;
+  canvas.height = vh;
+  ctx.drawImage(video, 0, 0, vw, vh);
+
+  // dataURL tipo "data:image/jpeg;base64,XXXX" -> teniamo solo la parte base64
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+  return dataUrl.split(",")[1];
+}
+
+async function interrogaBackend(base64Jpeg) {
+  const resp = await fetch(ENDPOINT_OCR, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ image_base64: base64Jpeg }),
+  });
+  if (!resp.ok) {
+    throw new Error(`Backend ha risposto ${resp.status}`);
+  }
+  return resp.json();
+}
+
+async function cicloScan() {
+  if (!scanning) return;
+  if (richiestaInCorso) {
+    setTimeout(cicloScan, INTERVALLO_SCAN_MS);
+    return;
+  }
+
+  const jpeg = catturaFotogrammaJPEG();
+  if (jpeg) {
+    richiestaInCorso = true;
+    guida.classList.add("scansione");
+    elScanState.textContent = "Analisi in corso…";
+
+    try {
+      const risultato = await interrogaBackend(jpeg);
+      processaRisultato(risultato);
+      elScanState.textContent = "Inquadra il codice nel riquadro";
+    } catch (e) {
+      elScanState.textContent = "Errore lettura: " + e.message;
+      log("Errore backend: " + e.message);
+    } finally {
+      richiestaInCorso = false;
+      guida.classList.remove("scansione");
     }
   }
-  // Se il codice non ha nessuno dei due prefissi, viene ignorato silenziosamente
+
+  setTimeout(cicloScan, INTERVALLO_SCAN_MS);
 }
 
-const html5QrCode = new Html5Qrcode("reader");
-const config = {
-  fps: 10,
-  qrbox: { width: 260, height: 180 },
-  aspectRatio: 1.4,
-};
+function processaRisultato(risultato) {
+  const { d, v } = risultato;
 
-html5QrCode
-  .start({ facingMode: "environment" }, config, onScanSuccess)
-  .catch((err) => {
-    log("Errore avvio fotocamera: " + err);
-    tg.showAlert("Impossibile avviare la fotocamera: " + err);
-  });
+  if (d && d !== codiceD) {
+    codiceD = d;
+    tg.HapticFeedback.impactOccurred("light");
+    suonaBip(880, 120);
+    log("Letto D: " + codiceD);
+    aggiornaUI();
+  }
+  if (v && v !== codiceV) {
+    codiceV = v;
+    tg.HapticFeedback.impactOccurred("light");
+    suonaBip(880, 120);
+    log("Letto V: " + codiceV);
+    aggiornaUI();
+  }
+}
+
+btnConferma.addEventListener("click", chiudiRiga);
+
+(async function init() {
+  try {
+    await avviaFotocamera();
+    elScanState.textContent = "Inquadra il codice nel riquadro";
+    scanning = true;
+    cicloScan();
+  } catch (e) {
+    elScanState.textContent = "Errore: " + e.message;
+    tg.showAlert("Errore avvio fotocamera: " + e.message);
+  }
+})();
 
 aggiornaUI();
 </script>

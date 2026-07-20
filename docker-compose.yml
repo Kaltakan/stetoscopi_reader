@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  frontend:
+    build: .
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    restart: unless-stopped
+    # Nota: non esponiamo la porta del backend all'esterno: la raggiunge
+    # solo "frontend" via rete Docker interna (proxy_pass http://backend:8000/).
